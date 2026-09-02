@@ -1,5 +1,7 @@
 import { marked } from 'marked'
 import type { Tokens } from 'marked'
+import { createHighlighterCore, type HighlighterCore } from 'shiki/core'
+import { createJavaScriptRegexEngine } from 'shiki/engine/javascript'
 
 export type TocItem = { id: string; text: string; level: number }
 
@@ -16,19 +18,58 @@ export function slugify(text: string): string {
 		.replace(/\s+/g, '-')
 }
 
-// Lazy load shiki to handle environments where it's not available (e.g., Cloudflare Workers)
-let shikiModule: typeof import('shiki') | null = null
+// Slim shiki: core + JS engine + curated languages, so the server bundle stays
+// under the Cloudflare Workers free-tier size limit. Languages outside the list
+// fall back to a plain code block (renderer.code already handles empty html).
+const LANG_IMPORTS: Record<string, () => Promise<unknown>> = {
+	typescript: () => import('@shikijs/langs/typescript'),
+	ts: () => import('@shikijs/langs/typescript'),
+	javascript: () => import('@shikijs/langs/javascript'),
+	js: () => import('@shikijs/langs/javascript'),
+	jsx: () => import('@shikijs/langs/jsx'),
+	tsx: () => import('@shikijs/langs/tsx'),
+	json: () => import('@shikijs/langs/json'),
+	css: () => import('@shikijs/langs/css'),
+	html: () => import('@shikijs/langs/html'),
+	xml: () => import('@shikijs/langs/xml'),
+	markdown: () => import('@shikijs/langs/markdown'),
+	md: () => import('@shikijs/langs/markdown'),
+	bash: () => import('@shikijs/langs/bash'),
+	sh: () => import('@shikijs/langs/bash'),
+	shell: () => import('@shikijs/langs/shell'),
+	python: () => import('@shikijs/langs/python'),
+	py: () => import('@shikijs/langs/python'),
+	java: () => import('@shikijs/langs/java'),
+	kotlin: () => import('@shikijs/langs/kotlin'),
+	c: () => import('@shikijs/langs/c'),
+	cpp: () => import('@shikijs/langs/cpp'),
+	csharp: () => import('@shikijs/langs/csharp'),
+	go: () => import('@shikijs/langs/go'),
+	rust: () => import('@shikijs/langs/rust'),
+	sql: () => import('@shikijs/langs/sql'),
+	yaml: () => import('@shikijs/langs/yaml'),
+	yml: () => import('@shikijs/langs/yaml'),
+	toml: () => import('@shikijs/langs/toml'),
+	dockerfile: () => import('@shikijs/langs/dockerfile'),
+	diff: () => import('@shikijs/langs/diff')
+}
+
+let highlighter: HighlighterCore | null = null
 let shikiLoadAttempted = false
 
 async function loadShiki() {
 	if (shikiLoadAttempted) {
-		return shikiModule
+		return highlighter
 	}
 	shikiLoadAttempted = true
 
 	try {
-		shikiModule = await import('shiki')
-		return shikiModule
+		highlighter = await createHighlighterCore({
+			themes: [import('@shikijs/themes/one-light')],
+			langs: Object.values(LANG_IMPORTS).map(load => load()),
+			engine: createJavaScriptRegexEngine({ forgiving: true })
+		})
+		return highlighter
 	} catch (error) {
 		console.warn('Failed to load shiki module:', error)
 		return null
@@ -206,11 +247,12 @@ export async function renderMarkdown(markdown: string): Promise<MarkdownRenderRe
 			const codeToken = token as Tokens.Code
 			const originalCode = codeToken.text
 			const key = `__SHIKI_CODE_${codeBlockMap.size}__`
+			const lang = (codeToken.lang || '').toLowerCase()
 
-			if (shiki) {
+			if (shiki && LANG_IMPORTS[lang]) {
 				try {
 					const html = await shiki.codeToHtml(originalCode, {
-						lang: codeToken.lang || 'text',
+						lang,
 						theme: 'one-light'
 					})
 					codeBlockMap.set(key, { html, original: originalCode })
@@ -221,7 +263,7 @@ export async function renderMarkdown(markdown: string): Promise<MarkdownRenderRe
 					codeToken.text = key
 				}
 			} else {
-				// Fallback when shiki is not available
+				// Fallback when shiki is not available or the language is not bundled
 				codeBlockMap.set(key, { html: '', original: originalCode })
 				codeToken.text = key
 			}
